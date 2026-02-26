@@ -19,13 +19,13 @@
 
 .EXAMPLE
     ##Panopto deployment
-    .\Setup-Credentials.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
+    .\CredEncrypt-Utility.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
 
     ##Any other app
-    .\Setup-Credentials.ps1 -Credentials @{ ApiKey="x"; TenantId="y" }
+    .\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x"; TenantId="y" }
 
     ##Dev mode - script not deleted on success
-    .\Setup-Credentials.ps1 -Credentials @{ ApiKey="x" } -Dev $true
+    .\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x" } -Dev $true
 #>
 
 
