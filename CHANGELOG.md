@@ -1,5 +1,9 @@
 # CredEncrypt-Utility Changelog
 
+## [2.0.1] - 26/02/26
+### Fixed
+- Encrypted credential files now correctly named for example C_AppNameClientId.txt instead of C_ClientId.txt
+
 ## [2.0.0] - 26/02/26
 ### Added
 - Fully generic and reusable - no longer Panopto-specific

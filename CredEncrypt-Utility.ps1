@@ -14,7 +14,7 @@
 .NOTES
     Name       : CredEncrypt-Utility
     Author     : Karim Saleh (SALEH03)
-    Version    : 2.0.0
+    Version    : 2.0.1
     Released   : 26/02/26
 
 .EXAMPLE
@@ -130,7 +130,7 @@ $encryptedFiles = @("$keyFile")
 
 foreach ($entry in $allCredentials.GetEnumerator())
 {
-    $fileName = "C_$($entry.Key).txt"
+    $fileName = "C_$($appName)$($entry.Key).txt"
     $filePath = "$credPath\$fileName"
 
     Save-EncryptedCredential -PlainText $entry.Value -OutputPath $filePath -Key $aesKey -Label $entry.Key
