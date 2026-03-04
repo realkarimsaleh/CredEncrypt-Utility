@@ -27,72 +27,28 @@ never written to disk at any point.
 
 ---
 
-## Quick Start
-
-### 1. Retrieve credentials from Secret Server
-
-Get the following values from Thycotic Secret Server
-> **Secret Server:** <https://thycotic.leedsbeckett.ac.uk/>
-> **Path:** <Secrets\ Support Services\ PanoptoDeltaInformant>
-
-| Secret Name                             | Purpose                                                    |
-|-----------------------------------------|------------------------------------------------------------|
-| `520d6e92-8211-419b-8fb3-b3f5009e7803`  | Client ID and Client Secret for API                        |
-| Panopto Delta Informant Service Account | Panopto Account used to Authenticate API                   |
-
-### 2. Run the script (Dev / Testing)
-
-```powershell
-.\CredEncrypt-Utility.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" } -Dev $true
-```
-
-### 3. Run the script (Production — script self-deletes on success)
-
-```powershell
-.\CredEncrypt-Utility.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
-```
-
-### 4. Verify output
-
-Check that the following files exist and are non-empty at `C:\Windows\Build\Panopto\`:
-
-```
-K_Panopto.txt
-C_PanoptoClientId.txt
-C_PanoptoClientSecret.txt
-C_PanoptoUsername.txt
-C_PanoptoPassword.txt
-```
-
-### 5. Deploy PanoptoDeltaInformant
-
-Once credential files are confirmed on the machine, deploy
-`PanoptoDeltaInformant.ps1` via SCCM with `$useEncryptedCredentials = $true`.
-
----
-
 ## Settings Block
 
 To retarget this script for a different application, only the SETTINGS block
 near the top of the script needs to change. No other edits are required.
 
 ```powershell
-$appName  = "Panopto"
+$appName  = "AppName"
 $basePath = "C:\Windows\Build"
 
 $hardcodedCredentials = [ordered]@{
-    ClientId = "520d6e92-8211-419b-8fb3-b3f5009e7803"
+    ClientId = "ClientID"
 }
 ```
 
 `$appName` drives all output paths and filenames automatically:
 
 ```
-C:\Windows\Build\Panopto\K_Panopto.txt
-C:\Windows\Build\Panopto\C_PanoptoClientId.txt
-C:\Windows\Build\Panopto\C_PanoptoClientSecret.txt
-C:\Windows\Build\Panopto\C_PanoptoUsername.txt
-C:\Windows\Build\Panopto\C_PanoptoPassword.txt
+C:\Windows\Build\AppName\K_AppName.txt
+C:\Windows\Build\AppName\C_AppNameClientId.txt
+C:\Windows\Build\AppName\C_AppNameClientSecret.txt
+C:\Windows\Build\AppName\C_AppNameUsername.txt
+C:\Windows\Build\AppName\C_AppNamePassword.txt
 ```
 
 ---
@@ -131,11 +87,11 @@ powershell.exe -ExecutionPolicy Bypass -File ".\CredEncrypt-Utility.ps1" -Creden
 
 | File                        | Contents                             |
 |-----------------------------|--------------------------------------|
-| `K_Panopto.txt`             | 32-byte AES-256 key (machine-unique) |
-| `C_PanoptoClientId.txt`     | Encrypted ClientId                   |
-| `C_PanoptoClientSecret.txt` | Encrypted ClientSecret               |
-| `C_PanoptoUsername.txt`     | Encrypted Username                   |
-| `C_PanoptoPassword.txt`     | Encrypted Password                   |
+| `K_AppName.txt`             | 32-byte AES-256 key (machine-unique) |
+| `C_AppNameClientId.txt`     | Encrypted ClientId                   |
+| `C_AppNameClientSecret.txt` | Encrypted ClientSecret               |
+| `C_AppNameUsername.txt`     | Encrypted Username                   |
+| `C_AppNamePassword.txt`     | Encrypted Password                   |
 
 ---
 
@@ -171,7 +127,7 @@ The script **never** self-deletes on failure regardless of mode.
 Every run appends to:
 
 ```
-C:\Windows\Build\Logs\Panopto_CredEncrypt-Utility.log
+C:\Windows\Build\Logs\AppName_CredEncrypt-Utility.log
 ```
 
 Log entries include timestamp, machine name, and result for each file written.
