@@ -2,7 +2,7 @@
 
 Run-once credential encryption utility. Generates a unique AES-256 key per
 machine and encrypts a set of application credentials into individual files.
-Designed for SCCM deployment as a pre-requisite to PanoptoDeltaInformant.
+Designed for SCCM deployment as a pre-requisite to dependent applications.
 
 ---
 
@@ -27,25 +27,18 @@ never written to disk at any point.
 
 ---
 
-## Settings Block
+## Parameters
 
-To retarget this script for a different application, only the SETTINGS block
-near the top of the script needs to change. No other edits are required.
+| Parameter      | Required | Default  | Description                                                      |
+|----------------|----------|----------|------------------------------------------------------------------|
+| `-AppName`     | Yes      | —        | Application name — drives all output folder names and filenames  |
+| `-Credentials` | Yes      | —        | Hashtable of credential name/value pairs to encrypt              |
+| `-Dev`         | No       | `$false` | `$true` skips self-deletion on success (testing only)            |
 
-```powershell
-$appName  = "AppName"
-$basePath = "C:\Windows\Build"
-
-$hardcodedCredentials = [ordered]@{
-    ClientId = "ClientID"
-}
-```
-
-`$appName` drives all output paths and filenames automatically:
+`-AppName` drives all output paths and filenames automatically:
 
 ```
 C:\Windows\Build\AppName\K_AppName.txt
-C:\Windows\Build\AppName\C_AppNameClientId.txt
 C:\Windows\Build\AppName\C_AppNameClientSecret.txt
 C:\Windows\Build\AppName\C_AppNameUsername.txt
 C:\Windows\Build\AppName\C_AppNamePassword.txt
@@ -53,45 +46,41 @@ C:\Windows\Build\AppName\C_AppNamePassword.txt
 
 ---
 
-## Parameters
-
-| Parameter      | Required | Default  | Description                                           |
-|----------------|----------|----------|-------------------------------------------------------|
-| `-Credentials` | Yes      | —        | Hashtable of credential name/value pairs to encrypt   |
-| `-Dev`         | No       | `$false` | `$true` skips self-deletion on success (testing only) |
-
----
-
 ## Usage Examples
 
 ```powershell
 # Panopto deployment
-.\CredEncrypt-Utility.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
+.\CredEncrypt-Utility.ps1 -AppName "Panopto" -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
 
 # Any other app
-.\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x"; TenantId="y" }
+.\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x"; TenantId="y" }
 
 # Dev mode - script not deleted on success
-.\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x" } -Dev $true
+.\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x" } -Dev $true
 ```
 
 ### SCCM Program Command Line
 
 ```
-powershell.exe -ExecutionPolicy Bypass -File ".\CredEncrypt-Utility.ps1" -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
+powershell.exe -ExecutionPolicy Bypass -File ".\CredEncrypt-Utility.ps1" -AppName "Panopto" -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
 ```
 
 ---
 
 ## Output Files
 
+All files are written to `C:\Windows\Build\<AppName>\`.
+
 | File                        | Contents                             |
 |-----------------------------|--------------------------------------|
 | `K_AppName.txt`             | 32-byte AES-256 key (machine-unique) |
-| `C_AppNameClientId.txt`     | Encrypted ClientId                   |
 | `C_AppNameClientSecret.txt` | Encrypted ClientSecret               |
 | `C_AppNameUsername.txt`     | Encrypted Username                   |
 | `C_AppNamePassword.txt`     | Encrypted Password                   |
+
+File names are derived directly from `-AppName` and the keys supplied in
+`-Credentials`. Adding a new key to the hashtable automatically creates a
+new encrypted file with no script edits required.
 
 ---
 
@@ -99,12 +88,13 @@ powershell.exe -ExecutionPolicy Bypass -File ".\CredEncrypt-Utility.ps1" -Creden
 
 Credentials are merged in this order before encryption:
 
-1. `$hardcodedCredentials` — defined in the SETTINGS block (e.g. ClientId)
+1. `$hardcodedCredentials` — static entries defined inside the script (empty by default)
 2. `-Credentials` parameter — runtime values passed at execution
 
 Runtime values take precedence. If the same key appears in both, the runtime
-value wins. This allows hardcoded defaults to be overridden per-deployment
-without editing the script.
+value wins. `$hardcodedCredentials` is intentionally empty in the default
+script — populate it only if a credential should be baked in for all
+deployments of a given app.
 
 ---
 
@@ -127,7 +117,7 @@ The script **never** self-deletes on failure regardless of mode.
 Every run appends to:
 
 ```
-C:\Windows\Build\Logs\AppName_CredEncrypt-Utility.log
+C:\Windows\Build\Logs\<AppName>_CredEncrypt-Utility.log
 ```
 
 Log entries include timestamp, machine name, and result for each file written.
@@ -136,6 +126,6 @@ Log entries include timestamp, machine name, and result for each file written.
 
 ## When Credentials Change
 
-1. Update the `-Credentials` parameter values in the SCCM program command line
+1. Update `-AppName` and `-Credentials` values in the SCCM program command line
 2. Update Distribution Points in SCCM
-3. Redeploy - each machine generates a new unique key and overwrites all files
+3. Redeploy — each machine generates a new unique key and overwrites all files
