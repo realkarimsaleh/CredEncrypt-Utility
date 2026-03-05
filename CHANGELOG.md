@@ -1,4 +1,4 @@
-# CredEncrypt-Utility Changelog
+# CredEncrypt-Utility CHANGELOG
 
 ## [2.0.1] - 26/02/26
 ### Fixed
