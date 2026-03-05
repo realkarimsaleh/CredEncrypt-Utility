@@ -14,22 +14,23 @@
 .NOTES
     Name       : CredEncrypt-Utility
     Author     : Karim Saleh (SALEH03)
-    Version    : 2.0.1
-    Released   : 26/02/26
+    Version    : 2.1.0
+    Released   : 05/03/26
 
 .EXAMPLE
     ##Panopto deployment
-    .\CredEncrypt-Utility.ps1 -Credentials @{ ClientSecret="x"; Username="y"; Password="z" }
+    .\CredEncrypt-Utility.ps1 -AppName "Panopto" -Credentials @{ ClientID="w"; ClientSecret="x"; Username="y"; Password="z" }
 
     ##Any other app
-    .\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x"; TenantId="y" }
+    .\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x"; TenantId="y" }
 
     ##Dev mode - script not deleted on success
-    .\CredEncrypt-Utility.ps1 -Credentials @{ ApiKey="x" } -Dev $true
+    .\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x" } -Dev $true
 #>
 
-
 param(
+    ##Name of the application - drives all folder names and file prefixes
+    [Parameter(Mandatory=$true)][string]$AppName,
     ##Hashtable of credential name/value pairs - keys become the encrypted file names
     #e.g. @{ ClientSecret="x"; Username="y"; Password="z" }
     [Parameter(Mandatory=$true)][hashtable]$Credentials,
@@ -38,28 +39,23 @@ param(
     [bool]$Dev = $false
 )
 
-
 ##Setting Variables
 $scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
 
 ##Script path used for self-deletion at the end
 $scriptPath = $MyInvocation.MyCommand.Definition
 
-#Change these values to retarget this script for a different application
-$appName  = "Panopto"
 $basePath = "C:\Windows\Build"
 
-##Hardcoded non-sensitive credentials - leave empty string if none required
-#These are added to the encrypted store alongside the runtime parameters above
-$hardcodedCredentials = [ordered]@{
-    ClientId = "520d6e92-8211-419b-8fb3-b3f5009e7803"
-}
+##Hardcoded non-sensitive credentials
+#Leave empty if none required
+$hardcodedCredentials = [ordered]@{}
 
 ##Derived paths
-#Driven entirely by $appName
-$credPath = "$basePath\$appName"
-$logPath  = "$basePath\Logs\$($appName)_$scriptName.log"
-$keyFile  = "K_$appName.txt"
+#Driven entirely by $AppName
+$credPath = "$basePath\$AppName"
+$logPath  = "$basePath\Logs\$($AppName)_$scriptName.log"
+$keyFile  = "K_$AppName.txt"
 
 ##Ensure folders exist
 foreach ($path in @($credPath, (Split-Path $logPath)))
@@ -77,7 +73,7 @@ function Write-SetupLog
     "[$((Get-Date).ToString('dd/MM/yyyy HH:mm:ss'))] [$env:COMPUTERNAME] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
 }
 
-Write-SetupLog "Credential setup started - App: $appName (Mode: $(if ($Dev) { 'DEV - no self-delete' } else { 'Production' }))"
+Write-SetupLog "Credential setup started - App: $AppName (Mode: $(if ($Dev) { 'DEV - no self-delete' } else { 'Production' }))"
 
 ##Generate a unique AES-256 key for THIS machine only
 $aesKey = New-Object byte[] 32
@@ -130,7 +126,7 @@ $encryptedFiles = @("$keyFile")
 
 foreach ($entry in $allCredentials.GetEnumerator())
 {
-    $fileName = "C_$($appName)$($entry.Key).txt"
+    $fileName = "C_$($AppName)$($entry.Key).txt"
     $filePath = "$credPath\$fileName"
 
     Save-EncryptedCredential -PlainText $entry.Value -OutputPath $filePath -Key $aesKey -Label $entry.Key
@@ -163,7 +159,7 @@ foreach ($file in $encryptedFiles)
 #Production only will be skipped entirely in dev mode
 if ($allGood)
 {
-    Write-SetupLog "Setup completed successfully - $($encryptedFiles.Count - 1) credential(s) stored for $appName"
+    Write-SetupLog "Setup completed successfully - $($encryptedFiles.Count - 1) credential(s) stored for $AppName"
 
     if ($Dev)
     {
