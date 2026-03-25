@@ -13,7 +13,7 @@
 
 .NOTES
     Name       : CredEncrypt-Utility
-    Author     : Karim Saleh (SALEH03)
+    Author     : Karim Saleh
     Version    : 2.1.0
     Released   : 05/03/26
 
