@@ -32,18 +32,6 @@ on the command line for unattended/SCCM deployment.
 
 ---
 
-## Screenshots
-
-### Encrypt
-
-![CredEncrypt Utility - Encrypt tab](docs/screenshots/screenshot-encrypt.png)
-
-### Decrypt
-
-![CredEncrypt Utility - Decrypt tab](docs/screenshots/screenshot-decrypt.png)
-
----
-
 ## Parameters
 
 | Parameter       | Required       | Default    | Description                                                                    |
