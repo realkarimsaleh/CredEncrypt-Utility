@@ -6,185 +6,718 @@
 
 .DESCRIPTION
     Credential Encryption Utility
-    Configure the SETTINGS block at the top for each deployment.
+    Double-click to launch GUI mode, or call via CLI with parameters.
     Plaintext values are never written to disk - only encrypted blobs are stored.
     Safe to run multiple times - will overwrite existing files.
-    Set -Dev $true to prevent self-deletion after successful setup (testing only).
+    Use -SelfDestruct to delete the script on success (production deployments).
+    Use -Decrypt to read and display existing encrypted credentials.
 
 .NOTES
     Name       : CredEncrypt-Utility
     Author     : Karim Saleh
-    Version    : 2.1.0
-    Released   : 05/03/26
+    Version    : 3.3.0
+    Released   : 05/06/26
 
 .EXAMPLE
-    ##Panopto deployment
-    .\CredEncrypt-Utility.ps1 -AppName "Panopto" -Credentials @{ ClientID="w"; ClientSecret="x"; Username="y"; Password="z" }
+    ##Encrypt credentials (CLI)
+    .\CredEncrypt-Utility.ps1 -AppName "Panopto" -Credentials @{ ClientID="w"; ClientSecret="x" }
 
-    ##Any other app
-    .\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x"; TenantId="y" }
+    ##Encrypt with custom path and self-destruct (CLI)
+    .\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x" } -BasePath "C:\Windows\Build" -SelfDestruct
 
-    ##Dev mode - script not deleted on success
-    .\CredEncrypt-Utility.ps1 -AppName "MyApp" -Credentials @{ ApiKey="x" } -Dev $true
+    ##Read/decrypt existing credentials - BasePath points directly at the credential folder (CLI)
+    .\CredEncrypt-Utility.ps1 -Decrypt -BasePath "C:\Temp\Panopto"
+
+    ##GUI mode - just double-click the script
 #>
 
 param(
-    ##Name of the application - drives all folder names and file prefixes
-    [Parameter(Mandatory=$true)][string]$AppName,
-    ##Hashtable of credential name/value pairs - keys become the encrypted file names
-    #e.g. @{ ClientSecret="x"; Username="y"; Password="z" }
-    [Parameter(Mandatory=$true)][hashtable]$Credentials,
-    ##Set $true to skip self-deletion after setup (dev/testing only)
-    ##Set $false for production SCCM deployment - script deletes itself on success
-    [bool]$Dev = $false
+    [string]$AppName        = "",
+    [hashtable]$Credentials = $null,
+    [string]$BasePath       = "C:\Temp",
+    [switch]$SelfDestruct,
+    [switch]$Decrypt
 )
 
-##Setting Variables
-$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
-
-##Script path used for self-deletion at the end
-$scriptPath = $MyInvocation.MyCommand.Definition
-
-$basePath = "C:\Windows\Build"
-
-##Hardcoded non-sensitive credentials
-#Leave empty if none required
-$hardcodedCredentials = [ordered]@{}
-
-##Derived paths
-#Driven entirely by $AppName
-$credPath = "$basePath\$AppName"
-$logPath  = "$basePath\Logs\$($AppName)_$scriptName.log"
-$keyFile  = "K_$AppName.txt"
-
-##Ensure folders exist
-foreach ($path in @($credPath, (Split-Path $logPath)))
+##Shared decryption function - CredPath = folder containing K_*.txt and C_*.txt files
+function Read-EncryptedCredentials
 {
-    if (-not (Test-Path $path))
+    param([string]$CredPath)
+
+    if (-not (Test-Path $CredPath)) { throw "Credential folder not found: $CredPath" }
+
+    $keyFiles = Get-ChildItem -Path $CredPath -Filter "K_*.txt" -ErrorAction Stop
+    if ($keyFiles.Count -eq 0) { throw "No key file (K_*.txt) found in: $CredPath" }
+    if ($keyFiles.Count -gt 1) { throw "Multiple key files found - ambiguous. Expected exactly one K_*.txt" }
+
+    $appName = $keyFiles[0].BaseName -replace '^K_', ''
+
+    $aesKey = Get-Content -Path $keyFiles[0].FullName -Encoding Default |
+              Where-Object { $_ -match '^\d+$' } |
+              ForEach-Object { [byte]$_ }
+
+    if ($aesKey.Count -ne 32) { throw "Key file corrupt (expected 32 bytes, got $($aesKey.Count))" }
+
+    $credFiles = Get-ChildItem -Path $CredPath -Filter "C_$appName*.txt" -ErrorAction Stop
+    if ($credFiles.Count -eq 0) { throw "No credential files (C_$appName*.txt) found in: $CredPath" }
+
+    $results = [ordered]@{}
+    $results["__AppName__"] = $appName
+
+    foreach ($file in $credFiles)
     {
-        New-Item -ItemType Directory -Path $path -Force | Out-Null
+        $keyName       = $file.BaseName -replace "^C_$([regex]::Escape($appName))", ""
+        $encryptedText = (Get-Content -Path $file.FullName -Encoding Default -Raw).Trim()
+        $secureString  = ConvertTo-SecureString -String $encryptedText -Key $aesKey
+        $ptr           = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString)
+        $plainText     = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)
+        $results[$keyName] = $plainText
     }
+
+    return $results
 }
 
-##Function to write timestamped entry to log file
+##Detect launch method
+$guiMode = [string]::IsNullOrWhiteSpace($AppName) -and -not $Decrypt
+
+##CLI decrypt mode
+if ($Decrypt -and -not $guiMode)
+{
+    $credFolder = if ([string]::IsNullOrWhiteSpace($AppName)) { $BasePath } else { "$BasePath\$AppName" }
+    Write-Host "`nCredEncrypt - Reading credentials from: $credFolder" -ForegroundColor Cyan
+
+    try
+    {
+        $creds = Read-EncryptedCredentials -CredPath $credFolder
+        Write-Host "App: $($creds['__AppName__'])`n" -ForegroundColor DarkGray
+        foreach ($entry in $creds.GetEnumerator())
+        {
+            if ($entry.Key -eq "__AppName__") { continue }
+            Write-Host "  $($entry.Key.PadRight(20)) : " -NoNewline -ForegroundColor Gray
+            Write-Host $entry.Value -ForegroundColor Yellow
+        }
+        Write-Host ""
+    }
+    catch { Write-Host "ERROR: $_" -ForegroundColor Red; exit 1 }
+
+    exit 0
+}
+
+if ($guiMode)
+{
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $iconBase64 = "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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATkgwAAIDCwAoJR0WHBsYcRYWFdUTExP9ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUE/kXFxXAHhwYVi4qIQwfHhgAdWZCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACHfEkAJSIdAC8sIgkdHBhWFxcVxxQUE/wTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFPcYFxWyHx0ZQDQxJAQrKB8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA9OSgAmYlUACIhGy4ZGBakFBQU9RMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUUFO0aGRaPJSMcIQAAAABIQSsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGxgRAAjIRoALCgeDBwbF2sWFRTfExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcWFdMdHBhaLiwgByUkHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEhCLwAAAAAAIyEcJxgYFaYUFBP5ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQT9RgYFpgkIxwfCAcLAEhFMwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADEsIgBDOysDHh0ZThYWFdQTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMT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E/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/X19e//Hx8f/8/Pz/urq6/0JCQf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFhXNISAaNQMGDABKQiwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATEIvAAMGCwAgHxk4FhYU0xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Ghoa/3h4d//o6ej///////////+RkZH/FRUV/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/EBAQ/yMjI/9mZmb/vLy8//Ly8v//////////////////////////////////////////////////////////////////////9vb2/8XFxf9vb2//Jycn/xAQEP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFf+RkpH////////////h4eD/aWlp/xYWFv8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcWFdEiHxo2BgYNAEtCLQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAUEorAA4NEgAhHxk0FhYU0hMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/JiYm/52dnf/4+Pj////////////Nzc3/Kysr/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8QEBD/JCQk/21tbf/Iycj/+fn5////////////////////////////////////////////////////////////////////////////////////////////+/v7/87Ozv9zc3P/JiYm/xAQEP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Kioq/8vLy/////////////T09P+Ojo7/ICAg/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FxYV0SIfGTQODhAAT0cuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdGtIABMTEwAiIBorFxYVzBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/NDQ0/7m5uf/+/v7////////////29vb/YmJi/xAQEP8TExP/ExMT/xMTE/8TExP/EhIT/xAQEP8gICD/aWlp/8jIyP/6+vr/////////////////////////////////////////////////////////////////////////////////////////////////////////////////+/v7/8vLy/9paWn/ICAg/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP9eXl7/9PT0/////////////Pz8/6urq/8rKyv/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFhXMIiAbKxQTFABxaEQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARUQzAB4dGAAkIhsgFxcVvxMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/Pj4+/8rKyv//////////////////////s7Oz/xsbG/8SEhL/ExMT/xMTE/8TExP/EBAQ/xgYGP9WVlb/vb29//n5+f//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+fn5/729vf9VVVX/FxcX/xAREP8TExP/ExMT/xMTE/8SEhL/Ghoa/66urv//////////////////////u7u7/zExMf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcXFb4kIhwfHhwZAFJKOwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMhGwApJx4TGBgWrBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/PT09/8/Pz///////////////////////8fHx/1FRUf8QEBD/ExMT/xMTE/8SEhL/EhIS/z09Pf+lpqX/8vLy////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8fHx/6Kiov86Ojr/ERER/xISEv8TExP/ExMT/xAQEP9OTk7/8PDw//////////////////////+/v7//MDAw/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRgWqionHhIjIhsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACwnIAA1LyQIGhkWjxQUE/0TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/NDQ0/8nJyf///////////////////////////7S0s/8aGhr/EhIS/xMTE/8QEBD/IiIi/319ff/i4uL//////////////////v7+/+zs7P/IyMf/qqqq/56enf+dnZz/paWk/7a2tv/Pz87/6eno//v7+/////////////////////////////X19f/a2tr/urq6/5+fn/+Njo3/iIiI/5GRkP+op6f/y8vK//Dw8P//////////////////////4ODg/3l5eP8gICD/EBAQ/xMTE/8TExP/GRkZ/7Gxsf///////////////////////////7i4uP8qKir/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUE/0aGReMNjEmBywoIQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADYzIwD//6UAHBsYaRQUFPYTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Jycm/7m5uf////////////////////////////n5+f9hYWH/Dw8P/xMTE/8RERH/RERE/7y8u//7+/v/////////////////6enp/4+Pj/9AQED/Hx4e/xQUFP8SEhL/ERER/xMTE/8XFxf/IiIi/zk5Of9jY2L/n5+f/9vb2//29vb/09PT/42Ojf9PT0//Kioq/xkZGf8SEhL/EBAQ/xAQEP8QEBD/FBQU/yAgIP9ISEf/mpqa/+3t7f/////////////////6+vr/t7e3/0FBQf8RERH/ExMT/w8PD/9fX17/+fn5////////////////////////////qamo/x8fH/8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQU9hsaF2cAAAAAMS4gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE1GMgAQEREAHh0YQRUVFOYTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/GRkZ/5ubm//+/v7////////////////////////////U1dT/KCgo/xAQEP8WFhb/ampq/+Li4v//////////////////////1NTU/05OTv8SEhL/Dg4O/w8PD/8PDw//Dw8P/w8PD/8PDw//EBAQ/xEREf8RERH/Dw8P/xMTE/8vLy//T09P/ykpKf8RERH/EBAQ/xISEv8SEhL/ERER/xAQEP8PDw//Dw8P/w8PD/8PDw//Dg4O/xQUFP9XV1f/2tra///////////////////////h4eH/ampq/xYWFv8RERH/Jycn/9LS0v////////////////////////////z8+/+MjIz/FhYW/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8VFRTlHx0ZPxESEQBWTToAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhHxoAJiMcHRcWFcYTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/3BwcP/39/f/////////////////////////////////l5eX/xEREP8bGxv/h4eH//Pz8///////////////////////3t7e/0VFRf8MDAz/FxcX/zIxMf9RUVH/aGdn/25ubf9nZ2b/VVZV/zw8O/8iIiL/ExMT/xAQEP8SEhL/ERER/w8PD/8SEhL/ExMT/xAQEP8RERH/Hh4e/zU1NP9OTk3/YGBg/2lpaP9kZGT/T09P/zExMf8XFxf/DAwM/0tLS//i4uL///////////////////////T09P+Kior/HR0d/xAQEP+UlJT/////////////////////////////////8vLy/2RkZP8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcXFcQnJB0bISAbAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAqKB4ANTIjBhkYFpQTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/z8/P//g4OD/////////////////////////////////+vr6/1tbW/8cHBz/mJiY//n5+f//////////////////////+Pj4/2lpaf8YGBj/W1tb/6+vrv/i4uH/9/f3//7+/v///////v79//n5+f/r6+v/zs7O/5mamf9WVlb/Hh4e/xISEv8TExP/EhIS/xgYGP9NTU3/kJCQ/8XFxf/m5uX/9vb1//z8/P/+/v7//f39//b29v/h4eH/rq6u/1paWv8XFxf/dHR0//v7+///////////////////////+vr6/56env8fHx//VlZW//j4+P/////////////////////////////////a29r/OTk5/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRkWkDczJAUqKB4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABORS4AAQQLAB0cGFYUFBTzExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xsbG/+tra3//////////////////////////////////////+Hh4P8+Pz7/nZ2d//z8/P///////////////////////////8PDw/9CQkL/qamp//X19f//////////////////////////////////////////////////////9/f3/6qqqv8kJCT/ERER/xsbGv+QkJD/8vLy///////////////////////////////////////////////////////19fX/pqam/0ZGRv/MzMz////////////////////////////9/f3/paWl/z9AP//d3d3//////////////////////////////////////6ampv8ZGRn/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFPIcHBhTBwgLAEpHNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIR8ZACYjGyAXFhXPExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP9fX1//9vb2///////////////////////////////////////MzMv/paWk//z8/P////////////////////////////////+5ubj/zMzM///////////////////////////////////////////////////////////////////////8/Pz/bGxs/wwMDP9SUVH/9PTz///////////////////////////////////////////////////////////////////////MzMz/wsLC//////////////////////////////////39/f+rq6v/ycnJ///////////////////////////////////////z8/P/WVlZ/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FxYVzSckHR4jIBsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMi4iAFFIMgMaGRaNExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FxcX/xMTE/8TExP/ExMT/xISEv8fHx//v7+/////////////////////////////////////////////9fX0//r6+v//////////////////////////////////////+/v6//7+/v///////////////////////////////////////////////////////////////////////////5STk/8NDQ3/dHRz//////////////////////////////////////////////////////////////////////////////////z8/P//////////////////////////////////////+/v7//X19f///////////////////////////////////////////729vf8fHx7/EhIS/xMTE/8TExP/ExMT/xkZGf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8aGReJYFY5AjUxJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAe2ZIABYWFQAfHRk/FRUU6xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/Kysr/1FRUf8SEhL/ExMT/xMTE/8QEBD/XFxc//f39/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+enp3/Dg4O/3h4eP/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////29vb/W1tb/xAQEP8TExP/ExMT/xMTE/9ZWVn/Jycn/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU6SAeGjwYFxYApKFjAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACgmHgAtKSAMGBcVsBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/3V2df9+fn7/EBAQ/xMTE/8TExP/GBgY/6+vr///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////np6e/w4ODv91dXT//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////6+vr/8YGBj/ExMT/xMTE/8RERH/ioqJ/21tbf8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFxWsLywhCiknHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGRYOQAMDQ8AHhwYVxQUFPcTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/yIiIv/Ly8v/ioqJ/xAQEP8TExP/EBAQ/z09PP/p6en//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////46Ojv8NDQ3/Z2dm//39/f/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////p6en/Pj4+/xAQEP8TExP/EBAQ/5WVlf/Dw8L/Hh4e/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQU9R0dGFIREhIASkUvAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAoJh4AKykgEhcXFcATExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP9ZWVn/+vr6/5OTk/8RERH/ExMT/xAQEP95eXj///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////n5+f/j5OP/xsfG/5ydnP86Ojr/EBAQ/ygoKP+Li4v/vby8/9zc3P/39/f//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////3l5ef8QEBD/ExMT/xISEv+dnJz/9/f3/1FRUf8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFxW7KygfDygmHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABZUTIADA0QAB0cGF4UFBP5ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT/oaGh//////+kpKT/ExMT/xMTE/8YGBj/tLS0////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8vLy/66urv9gYGD/MzMy/x4eHf8TExP/ERER/xMTE/8SEhL/ERER/xkZGf8sLCz/V1hX/6Ghof/p6en///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+zs7P/FxgX/xMTE/8VFRX/rq6t//////+ampn/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQU9xwbF1YRERIAR0ErAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJyMdACklHhAXFhW/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Kysr/9nZ2f//////u7u7/xkZGf8RERH/Li4u/97e3v/////////////////////////////////////////////////////////////////////////////////9/f3/////////////////////////////////////////////////////////////////0tLS/1tbW/8YGBj/Dw8P/xEREf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/w8PD/8UFBT/RkZG/7y8vP/+/v7////////////////////////////////////////////////////////////+/v7/////////////////////////////////////////////////////////////////////////////////3Nzc/ywsLP8RERH/HBwb/8PDw///////19fW/ykpKf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFhW5KykfDSgmHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAdGlGABIREwAdHBhTFBQT9xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/1RVVP/39/f//////9XV1P8mJiX/Dg4O/09PT//29vX////////////////////////////////////////////////////////////5+fn/2tva/62urf98fHz/nZ2d//7+/v//////////////////////////////////////////////////////wcHB/zY2Nv8PDw//ERER/xAQEP8UFBT/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFP8QEBD/ERER/w8PD/8nJyf/rq+u////////////////////////////////////////////////////////////qKin/3l5ef+srKv/3Nzc//v7+/////////////////////////////////////////////////////////////T09P9LS0v/Dg4O/yoqKf/a29r///////f39/9WVlX/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQU9R0cGEwUFBMAmJKHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC8tIgA1MiUIGBcWrxMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP+EhIT////////////s7Ov/PDw8/w0NDf9zc3P///////////////////////////////////////////////////////T09P+0tLT/YGBg/ysrK/8WFhb/CwsL/2pqav//////////////////////////////////////////////////////3Nzc/zs7O/8PDw//EBAQ/yYmJf9qamr/YmJi/xQUFP8TExP/ExMT/xMTE/8TExP/ExMT/xQUFP9mZmb/b29v/ygoKP8QEBD/EBAQ/y4uLv/Ozs7//////////////////////////////////////////////////////319ff8MDAz/FRUV/y0tLf9oaWj/vLy8//b29v////////////////////////////////////////////////////7/bW1t/wwMDP9DQ0P/8PDw////////////iYmI/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8ZGBaoQDkpBjQvIwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbGhgAIB8aOxUVFO4TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8VFhb/rq6u////////////+/v7/2FhYf8NDQ3/lJST/////////////////////////////////////////////////9DQ0P9eXl7/Ghoa/w8PD/8RERL/ExMT/w8PD/9paWj//v7+/////////////////////////////////////////////////4KCgv8QEBD/FRUV/1tbW//Ly8v/x8fH/z8/P/8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/QEBA/8fHx//Pz8//YmJi/xcXF/8PDw//aWlp//v7+/////////////////////////////////////////////////98fHz/Dw8P/xMTE/8RERH/Dw8P/x0dHf9jY2P/1NTU/////////////////////////////////////////////////46Ojv8MDQz/ampq//39/f///////////7a1tf8YGBf/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU6iEgGjMdHBgAAAAAAAAAAAAAAAAAAAAAAAAAAABBOyoAAAAAABoZFowTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/ISEh/87Ozv////////////////+Pj4//ExMS/6ysrP///////////////////////////////////////f39/7CwsP8xMTH/EBAQ/xISEv8TExP/ExMT/xMTE/8PDw//XV1d//v7+/////////////////////////////////////////////Dw8P9ERET/Dg4O/zk5Of+pqqn/h4eH/y8vL/8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8uLi7/hYWF/66urv9DQ0L/Dw8P/y8vL//g39//////////////////////////////////////////////////cXBw/w8PD/8TExP/ExMT/xMTE/8SEhL/EBAQ/zU1Nf+3t7f//v7+//////////////////////////////////////+pqan/ExQT/5ycm//////////////////V1dX/JiYm/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8aGReBAAAAAEhCMQAAAAAAAAAAAAAAAAAAAAAAJCEcACUiHRsWFRTUExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/zAwMP/i4uL/////////////////wsLB/yUlJP/AwL///////////////////////////////////////6+vr/8lJSX/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/0pKSv/09PT////////////////////////////////////////////l5eX/MjIy/xAQEP8ZGRn/Gxwb/xEREf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/xEREf8bGxv/Ghoa/xISEv8jIyL/0tLS////////////////////////////////////////////+/v7/1xcXP8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/KSkp/7i4uP//////////////////////////////////////vb29/ykpKf/MzMz/////////////////6enp/zg4OP8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhYUzSckHRUmIx0AAAAAAAAAAAAAAAAAUEk6ABMTEwAcGhdXFBQT+hMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP8/Pz//7u7u/////////////////+np6f9MTEv/zs7O/////////////////////////////////9HR0f8xMTH/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf81NTX/5ubm////////////////////////////////////////////+Pj4/2pqav8QEBD/EBAQ/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xAQEP8ODg7/UVFR/+7u7v///////////////////////////////////////////+/v7/9CQ0L/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP84ODj/2dnZ/////////////////////////////////8rKyv9VVVT/8PDw//////////////////T09P9LS0v/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFPcdHBhNFhUVAKmfXwAAAAAAAAAAADgyJQBUSTMDGBcVohMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/TExM//X19f/////////////////9/f3/i4uK/9jY2P////////////////////////////n5+f9paWj/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/ICAg/8vLyv/////////////////////////////////////////////////n5+f/hISE/zs7O/8gICD/FRUV/xEREf8PDw//Dw8P/w8PD/8PDw//Dw8P/w8PD/8PDw//Dw8P/w8PD/8QEBD/FBMT/x4eHv82Njb/cnJy/9nZ2f/////////////////////////////////////////////////W1tb/KCgn/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/3Jycv/7+/v////////////////////////////V1dT/l5eX///////////////////////7+/v/XFxc/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GBgWl+e/fwE8NSkAAAAAAAAAAAAkIRsAJSMcIRYVFN0TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/1dXVv/5+fn//////////////////////9bW1f/r6+v////////////////////////////Q0ND/JSUl/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xITEv+ZmZn///////////////////////////////////////////////////////39/f/q6en/zMzM/6+vrv+TlJP/e3x7/2pqav9eXl7/V1ZW/1VUVP9XVlb/XV1d/2ZmZv90dHT/iYmJ/6ampf/Gx8b/5ubm//z8/P//////////////////////////////////////////////////////pKSk/xQVFP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8pKSn/1dXV////////////////////////////6enp/93d3P///////////////////////v7+/2trav8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xYWFdQnJB4ZJyQdAAAAAACZiVQAExQTAB4dGVcUFBT7ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/w8PD/9eXl3//Pv7///////////////////////9/f3//v7+////////////////////////////mJmY/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/VFRU//X19f/////////////////////////////////////////////////////////////////////////////////+/v7/+/v7//n5+f/5+Pj/+fn5//v7+//+/f3/////////////////////////////////////////////////////////////////////////////////+Pj4/15eXv8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/52dnf////////////////////////////7+/v/+/v7///////////////////////////9zc3P/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT3Hx0aShgXFgAAAAAATEczAP///wAaGReYExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//X15e//z8+////////////////////////////////////////////////////////////3FxcP8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/x4eHv+6urr//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8TExP8iIiL/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/w8PD/91dXT/////////////////////////////////////////////////////////////////dnZ2/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xsaF4gAAAAAVE0zACsoHwArKB8SFxYVzRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/1tbWv/7+/r///////////////////////////////////////////////////////39/f9jY2L/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/T09P/+vr6/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////Hx8f9cXFz/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//ZWVk//39/f///////////////////////////////////////////////////////////3Z2dv8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFxXCMS8jDTEuIgAdHBgAIB4ZNRUUFO8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/w8PD/9QUFD/9/f3///////////////////////////////////////////////////////9/f3/Z2Zm/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/99fX3/+vr6//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////39/f+NjY3/FhYW/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/2tra//+/v7///////////////////////////////////////////////////////////9wcG//Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU6SIhGywgHxkAEBASABsaF2MUExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/Q0ND//Dw8P///////////////////////////////////////////////////////////3p6ev8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/HBwc/6Wlpf////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+zs7P/IiIi/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP+Dg4L////////////////////////////////////////////////////////////9/fz/Y2Nj/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQTE/wcGhdYFBQTAAAAAAAYGBaTExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/zQ0NP/m5ub///////////////////////////////////////////////////////////+cnJz/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8tLS3/x8fH///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////Q0ND/NTU1/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT/qKin////////////////////////////////////////////////////////////+Pj4/1NTU/8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRcWiAAAAgAvLCELFhYVvBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8mJib/1tbW////////////////////////////////////////////////////////////yMjI/x8fH/8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/0dHR//h4eH////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////m5uX/Tk5O/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/JiYm/9PT0////////////////////////////////////////////////////////////+7u7v8/QD//EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcWFbU0MCMIIiAbIBUVFNoTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Ghoa/76+vv///////////////////////////////////////////////////////////+7u7v9DREP/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Z2hn//Pz8//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////09PT/bW1t/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8Q/1JSUf/19fX////////////////////////////////////////////////////////////d3t3/LCws/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFRTWJSMcHCAeGj4VFBTvExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv+enp3/////////////////////////////////////////////////////////////////iIiI/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xUVFf+Li4v//Pz8///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8/Pz/jo+O/xYXFv8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/+am5r/////////////////////////////////////////////////////////////////wsPC/xwcHP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRQU7B8eGTkdHBlfFBQU+hMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//d3d3/////////////////////////////////////////////////////////////////9bW1v8tLS3/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/ICAg/66vrv//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////sLCw/yEhIf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf85OTj/4uLi/////////////////////////////////////////////////////////////////52dnf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFPkdHBhcGxsXghMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/05OTv/19fX////////////////////////////////////////////////////////////+/v7/hISE/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8yMjL/zc7N////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////zc3N/zIyMv8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT/lZWV//////////////////////////////////////////////////////////////////////9xcXH/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/HBoYfhoZF6ETExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8sLCz/3Nzc/////////////////////////////////////////////////////////////////+Xl5f9FRUX/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/0xMTP/l5eX/////////////////////////////////////////////////////////////////////////////////////////////////////////////////4+Pj/0tLS/8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/UVFR/+3t7f/////////////////////////////////////////////////////////////////x8fH/RkdG/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xoZF58ZGBa9ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhcW/7CwsP//////////////////////////////////////////////////////////////////////wMDA/ykpKf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/ERER/xAQEP8RERH/ExMT/xMTE/8RERH/bGxs//T09P//////////////////////////////////////////////////////////////////////////////////////////////////////8/Pz/2lpaf8RERH/ExMT/xMTE/8RERH/EBAQ/xEREf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/Li4u/8nJyf//////////////////////////////////////////////////////////////////////0tLS/yUlJf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8ZGRa5GBcW0hMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP92d3b///////////////////////////////////////////////////////////////////////////+lpaT/Hh8e/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT/Xl5d/5qamv94eHf/ODg3/xMTE/8RERH/EhIS/xYWFv+Pj4///f39/////////////////////////////////////////////////////////////////////////////////////////////Pz8/4qKiv8VFRX/ExMT/xEREf8TExP/ODg4/3Z2dv+UlJP/S0tL/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/IyMj/6+vr////////////////////////////////////////////////////////////////////////////6Ghof8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GBcV0BcWFeITExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/Pj4+/+vr6v///////////////////////////////////////////////////////////////////////Pz7/5WVlP8aGhr/EhIS/xMTE/8TExP/ExMT/xMTE/8SEhL/HBwc/8TEw////////v7+/+Pj4/+Pj4//Kysr/xEREf8SEhL/ISEh/7Kysv///////////////////////////////////////////////////////////////////////////////////////////6ysrP8fHx//EhIS/xEREf8nJyf/jIyM/+Tk4//+/v7//////7CwsP8WFhb/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/HR0d/56env/9/f3///////////////////////////////////////////////////////////////////////z8/P9lZWX/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcXFeAWFhXtExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xsbG/+6urr////////////////////////////////////////////////////////////////////////////5+fn/iYqJ/xgYGP8SEhL/ExMT/xMTE/8TExP/ExMT/xQUFP+goKD//////////////////v7+/8fHx/9DQ0P/EhIS/xAQEP80NDT/0dHR/////////////////////////////////////////////////////////////////////////////////9HR0f8yMjL/ERER/xISEv87Ozv/vb29//7+/v////////////////+Pj4//EhIS/xMTE/8TExP/ExMT/xMTE/8SEhL/GBgY/42Ojf/7+/r////////////////////////////////////////////////////////////////////////////g4OD/MTIx/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFhXsFhYU9RMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/c3R0//7+/v////////////////////////////////////////////////////////////////////////////b29v9+fn3/FRUV/xISEv8TExP/ExMT/xMTE/8RERH/RkZG/+Pj4///////////////////////sbGx/x4dHv8SEhL/Dw8P/2JiYv/4+Pj///////////////////////////////////////////////////////////////////////n5+f9lZWX/Dw8P/xISEv8dHRz/qKio///////////////////////e3t7/PDw8/xEREf8TExP/ExMT/xMTE/8SEhL/FRUV/35+fv/39/f/////////////////////////////////////////////////////////////////////////////////qKio/xUVFf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhYV9BUVFPgTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/zMzM//g4OD/////////////////////////////////////////////////////////////////////////////////8vLy/3BwcP8TExP/ExMT/xMTE/8TExP/ExMT/xISEv9dXV3/19fX//f39//w8PD/q6yr/zw8PP8TExP/ExMT/xISEv8nKCf/19fX///////////////////////////////////////////////////////////////////////g4N//Li4t/xEREf8TExP/ExQT/zIzMv+ZmZn/6urq//n5+f/X19b/WlpZ/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/3BwcP/y8vL/////////////////////////////////////////////////////////////////////////////////+fn5/2BgYP8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFPgVFRT5ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBT/np6e///////////////////////////////////////////////////////////////////////////////////////t7Oz/Y2Rj/xIREv8TExP/ExMT/xMTE/8TExP/EhIS/y4uLf9PT0//RERE/xsbG/8RERH/ExMT/xMTE/8TExP/Gxsb/8LCwv//////////////////////////////////////////////////////////////////////0NDQ/yIiIv8SEhL/ExMT/xMTE/8RERH/FhYW/z4+Pv9UVFP/Ly8v/xISEv8TExP/ExMT/xMTE/8TExP/ERER/2NjY//s7Oz//////////////////////////////////////////////////////////////////////////////////////9LS0v8nKCf/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8VFRT5FRUU+RMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/09PT//y8vL//////////////////////////////////////////////////////////////////////////////////////+bm5v9XV1f/ERER/xMTE/8TExP/ExMT/xMTE/8RERH/Dw8P/xAQEP8SEhL/ExMT/xMTE/8TExP/EhIS/x0dHf/Hx8f//////////////////////////////////////////////////////////////////////9LS0v8jIyP/EhIS/xMTE/8TExP/ExMT/xMTE/8QEBD/Dw8P/xEREf8TExP/ExMT/xMTE/8TExP/ERER/1ZWVv/m5ub///////////////////////////////////////////////////////////////////////////////////////////+IiIf/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU+RYVFPcTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8dHR3/vLy8////////////////////////////////////////////////////////////////////////////////////////////39/f/0xNTP8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8tLCz/3d3d///////////////////////////////////////////////////////////////////////j4+P/MjEx/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/0xMTP/e3t7////////////////////////////////////////////////////////////////////////////////////////////l5uX/Ozs7/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFPgXFxXzExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/2lpaf/7+/v////////////////////////////////////////////////////////////////////////////////////////////X19f/QkJC/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//VlZW//f39///////////////////////////////////////////////////////////////////////+Pj4/1lZWf8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/0JCQv/X19f/////////////////////////////////////////////////////////////////////////////////////////////////oKCg/xUVFf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFhX1FxYV6BMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8nJyf/z8/P/////////////////////////////////////////////////////////////////////////////////////////////////87Ozv85OTn/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhYW/6Wlpf////////////////////////////////////////////////////////////////////////////////+mp6b/FhYW/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/zo6Ov/Pz8//////////////////////////////////////////////////////////////////////////////////////////////////8PDw/0xMTP8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhYV6xgXFdwTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/3x8fP/+/v7/////////////////////////////////////////////////////////////////////////////////////////////////xMTE/zMzM/8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/1hYWP/w8PD/////////////////////////////////////////////////////////////////////////////////8PDw/1paWv8PDw//ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/zMzM//Gxsb//////////////////////////////////////////////////////////////////////////////////////////////////////7S0tP8aGhr/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcXFeAYGBbKExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8wMDD/2tra///////////////////////////////////////////////////////////////////////////////////////////////////////BwcH/Nzc3/w8PD/8SEhL/ExMT/xMTE/8RERH/EBAQ/0dHR//X19f////////////////////////////////////////////////////////////////////////////////////////////a2tr/S0tL/xAQEP8RERH/ExMT/xMTE/8SEhL/Dw8P/zY2Nv/AwcD///////////////////////////////////////////////////////////////////////////////////////////////////////f39/9eXl7/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8YGBbOGhgXshMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/4qJif///////////////////////////////////////////////////////////////////////////////////////////////////////////9TU1P9mZmb/JiYm/xcXFv8ZGRn/MDAw/3l5ef/g4OD//////////////////////////////////////////////////////////////////////////////////////////////////////+Pj4/98fHz/MDAw/xkYGP8WFhb/JiYl/2VlZf/S0tL////////////////////////////////////////////////////////////////////////////////////////////////////////////ExMT/ISEh/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRgWuhsZF5UTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf86Ojr/5eXl////////////////////////////////////////////////////////////////////////////////////////////////////////////+Pj4/9TT0/+1tbT/vLy7/9/g3//8/Pz//////////////////////////////////////////////////////////////////////////////////////////////////////////////////Pz8/9/f3v+7u7r/tLS0/9PT0//4+Pj////////////////////////////////////////////////////////////////////////////////////////////////////////////7/Pv/bW5t/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xoZF6AdGxhzFBMT/RMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUV/6Ghof//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////0NDQ/ygoKP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8cGxiAHhwZURQUFPYTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP9QUFD/8/Pz/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////v7+/3x9fP8QEBH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBP6HRsYYCAeGjAVFRTnExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/HR4d/8DBwP///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////97e3v8yMjL/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRQU7x8dGj4pJh4WFhYVzhMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP98fHz///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+YmJj/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFNsiIRshTEMvBBcXFakTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/Q0ND/+/v7v/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////z8/L/Tk5N/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFhW9LishDAACCQAaGRZ8ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/yAgIP/Nzcz/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////xsbG/yAgH/8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRgWlAAAAAAXFhUAHRwYTRQUE/kTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8QEBD/FhYW/yYmJv85OTj/u7u6/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////4uLi/8WFhb/FBMT/xAQD/8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xsaF2UPEBEAIiAbACMhGyQVFRTjExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xAQEP8pKSn/a2tr/62trf/V1tX/6eno//j4+P/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////V1dX/uLi4/6WlpP97e3v/Q0NC/xgYGP8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUUFPEgHhk4HBsXADUxJAA4NCYJGBcWuRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xcXF/9lZWX/0NDQ//v7+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+3t7f+rq6v/RERE/xISEv8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFhTQKSYeFSknHwBhXEQAAAABABsaF4ATExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/x0dHf+Ojo7/9fX0///////////////////////8/Pz//Pz8/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+bm5f9vb2//FhYW/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GRgWn45/TQJFPisAAAAAABkZFwAfHhpDFBQU9RMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xgYGP+QkJD/+/v7////////////+vr6/8vLy/+HiIf/Y2Nj/2JiYf+IiYj/1NTU//7+/v//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////7+/v/7a2tv+Li4v/iYmJ/6ysrP/g4OD//f39////////////8/Pz/3h4eP8UFBT/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBQU/R0cGWIQERIAal07AAAAAAApJh4AKiYfFhYWFdATExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf9sbGz/9vb2////////////5+fn/3l5ef8kJCT/EBAQ/w8PD/8PDw//EBAQ/y4uLv+pqan//f39////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////0NDQ/1RUVP8YGRj/EBAQ/xAQEP8VFRX/MzMz/46Ojv/w8PD////////////v7+//XV1d/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFOYjIRsqIR8aAAAAAAAAAAAAQzsqAAAAAAAZGBaQExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf84ODj/3Nzc////////////5OTk/1hYWP8RERH/EhIS/xMTE/8TExP/ExMT/xMTE/8QEBD/JSUl/7e3t///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////09PS/z09Pf8PDw//ExMT/xMTE/8TExP/ExMT/xEREf8TExP/a2tr/+3t7f///////////9DQ0P8tLS3/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFxW1MzAjCC4rIAAAAAAAAAAAAAAAAAAXFxUAHRwYSRQUFPYTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UExT/lZWV////////////9PT0/2dnZ/8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP86Ojr/2dnZ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////6enp/1BQUP8QEBD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/xISEv93d3f/+Pj4////////////gYGB/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GhoXbgoLDgBJRi4AAAAAAAAAAAAAAAAAJyQdACglHhMWFhXKExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/MzMz/+Dg4P///////////6enp/8YGBj/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/2VlZf/19fX//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////Pz8/4GBgf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/Gxsb/7CwsP///////////9HR0f8nJyf/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU5iAfGiweHRkAAAAAAAAAAAAAAAAAAAAAAEM9KwAAAAAAGhkXgRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/Dw8P/21tbP/9/f3///////Pz8/9PT0//Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8YGBj/o6Oj/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////729vf8iIiL/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/w8PD/9SUlL/9PT0///////4+Pj/WVlZ/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xgXFqk7NykFMC0jAAAAAAAAAAAAAAAAAAAAAAAAAAAAHh0YACIgGjMVFRTqExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/+ioqL////////////T09L/JSUk/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/zo6Ov/f39///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+vr6v9MTEz/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/IyMj/8/Pzv///////////46Pjv8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFPkeHBhWExISAIyHawAAAAAAAAAAAAAAAAAAAAAAAAAAADQvIgA+OSgGGBgWqRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8dHR3/xsbG////////////t7e3/xcXF/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/gICA//39/f////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+RkZD/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUFP+rq6v///////////+3t7f/GBgY/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFhXLKyggFikmHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACPjIEAFBQTAB0cGE8UFBP2ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/KCgo/9nZ2f///////////6usq/8UFBT/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/ycnJ//Gxsb////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////Pz8//Ly8v/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/mZiY////////////zs7O/yEhIf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UExP/GhoXdQAABQBCPCwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACclHAAqJx4OFxcVvRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/y8uLv/h4eD///////////+1tbX/FxcX/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/RkZG/9XV1f/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////e3t7/TU1N/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/5ycnP///////////9jY1/8nJyf/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FhUU2iMgGiIgHhkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABaWUUADQ0PABwcGFwUFBP5ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8sLCz/3t7e////////////zc3N/yEhIf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf87Ozv/sLCw//n5+f////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////39/f/Hx8f/SUlJ/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcYF/+2trb////////////X19b/JiYm/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xoZFoAAAAAANjEjAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACclHgArKB8SFxcVwBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/IyMj/9LS0v///////////+rq6v88PDz/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/x0dHf90dHT/4eHh/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////+vr6/+Hh4f/Jycn/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8rLCv/29vb////////////y8vL/yAgH/8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xYVFNwjIRolIB8ZAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABhWDoACwwPAB4cGVoUFBT4ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xgYGP+5ubj////////////+/v7/c3Nz/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/ERER/0BAP/+2trb//Pz8/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////9HR0f9TU1P/ExMT/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//XV1d//n5+f///////////7Kysv8XFxb/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8bGhd9AAAAAD06LAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACclHQAsKB8NFxcVtBMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/jY2N/////////////////8DAwP8eHh7/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/ISEh/6Kiov///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////8XFxf82Njb/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GBgY/6ysrP////////////////+IiIj/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFhTSJCIbHiEgGQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABlVzcAFBQUAB4cGUUUFBTuExMT/xMTE/8TExP/ExMT/xMTE/8TExP/DxAQ/1VVVP/29vb////////////39/f/Y2Nj/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP80NDT/4ODg//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////Ly8v9RUVH/Dw8P/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/05OTv/v7+/////////////29vb/UlNS/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8UFBP6HBoXZgAACgBDPCUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC4rIQA/OisEGRkWlRMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8kJCT/zMzM/////////////////87Ozv8tLS3/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FxcX/7i4uP///////////////////////Pz8//r6+f/+/v7//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////v7+///////////////////////T09P/JCQk/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EhIS/x4fHv+2trb/////////////////z8/O/yUlJf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/GBcVtysoHxAnJR0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHx0ZACMhGyYWFhXWExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/3p6ev/+/v7/////////////////np6e/xkZGf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xYWFf+xsbH////////////t7e3/h4eH/19fX/9XV1f/goKC/8TExP/w8PD//////////////////////////////////////////////////////////////////////////////////////////////////////////////////f39/+Tk5P+srKz/dXV1/2tra/+QkJD/6+vr////////////y8vL/x8fH/8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv97fHv/+vr6/////////////////4KCgv8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU6yAeGUEWFhQAWlIxAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD46KQAAAAMAGxsXYRQUE/cTExP/ExMT/xMTE/8TExP/ExMT/xEREf8rKyv/0dHR//////////////////j4+P98fHz/FBQU/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8fHx//ysrJ////////////wMDA/xkZGf8ODg7/Dw8P/xAQEP8eHh7/R0dH/4SEhP/BwcH/7Ozs//7+/v////////////////////////////////////////////////////////////////////////////z8/P/m5+b/tba1/3Jzcv82Njb/FhYW/w8PD/8PDw//FRYV/7W2tf///////////9vb2/8qKir/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP9aW1r/6+vr/////////////////9jY2P8xMTH/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/hoZFoZXTzQCMi4iAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKCUcAC8rHwoYGBagExMT/xMTE/8TExP/ExMT/xMTE/8TExP/EBAQ/2hoaP/29vb/////////////////8PDw/3BwcP8UFBT/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8PDw//S0tL//Dw8P///////////4uMi/8RERH/ExMT/xMTE/8TExP/EhIS/xAQEP8QEBD/HR0c/z8/P/91dXT/ra2t/9zc2//39/f////////////////////////////////////////////29vb/2dnZ/6mqqf9tbW3/ODg4/xkZGf8QEA//ERER/xMTE/8TExP/ExMT/xAQEP9/gH/////////////09PT/UFBQ/w8PD/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf9TU1P/4ODg//////////////////n5+f9xcnH/ERER/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcWFcImJB0YIiAaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHhqTAAdHBkAIyEbJhYWFdITExP/ExMT/xMTE/8TExP/ExMT/xISEv8ZGRn/n5+f///////////////////////w8PD/e3x7/xkZGf8RERH/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/HR0d/7CwsP///////////+7u7f9GRkb/EBAQ/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8QEBD/Dw8P/xYWFv8sLCz/VFNT/4WFhf+2trb/2NnY/+fn5//n5ub/2NfX/7S0s/+Dg4P/UVJR/yoqKv8VFRX/Dw8P/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/QEBA/+rq6v///////////6SkpP8XFxf/EhIS/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/xUVFf9kZGT/4+Pj//////////////////////+rq6v/HR0d/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xUVFOgfHhlBEhITAFpQNAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASUMtAAMECwAeHRhPFRQU7hMTE/8TExP/ExMT/xMTE/8TExP/ERER/yoqKf+9vb3///////////////////////f39/+goKD/MDAw/xAQEP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/FxcX/4iIiP/6+vr///////////+oqKf/GBgY/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/w8PD/8QEBD/GBgY/ygoKP81NTT/NTU0/ygoJ/8XFxf/EBAQ/xAQEP8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xcXF/+lpqX////////////z8/P/aWlp/xEREf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/Dw8Q/ycnJ/+Ojo3/8fHx///////////////////////Ky8r/MjIy/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xQUE/ocGhdzoI9TATcyJAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyLSEAUUcwAxsaF3wUFBP7ExMT/xMTE/8TExP/ExMT/xMTE/8RERH/NTU1/8TExP///////////////////////v7+/9TU1P9wcXD/KCgo/xEREf8PDw//EBEQ/xEREf8RERL/ERER/w8PD/8QEBD/LCws/5aWlv/29vb////////////g4OD/Pz8//xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/ERER/xEREf8SEhL/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/QkJB/+Pj4////////////+np6f9tbW3/GRkZ/w8PD/8RERH/EhIS/xMTE/8SEhL/EhIS/xAQEP8QEBD/ICAg/19gX//Hx8f//f39///////////////////////U1NP/QUFB/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8YGBagLisfDCglHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACclHQAuKiANGRgWohMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xAQEP8xMTH/tLS0//39/f//////////////////////+/v7/9PT0v+RkZD/Wlpa/zs7O/8tLS3/Kysr/zU1Nf9PT0//hoaG/9PT0//9/f3////////////v7+//ZmZm/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv9wcHD/9PT0////////////9fX1/66urv9aW1r/Li4u/x4eHv8aGhr/HR0d/ygoKP9GRkX/fX18/8TExP/29vb////////////////////////////IyMf/QEBA/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8XFhXDJCIcHh4cGQCHd0wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB3ZkwAHx4ZACUkHR0XFxW+ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ERER/yMjI/+Pj4//7+/v//////////////////////////////////n5+f/r6+v/3+Dg/93d3f/m5+b/9vb2///////////////////////o6Oj/bGxs/xQUFP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/FhYW/3x8fP/x8fH/////////////////+Pj4/9/f3//Jycj/v7+//8bGxv/Y2dj/8fHw//7+/v////////////////////////////X19f+ioqL/Li4u/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8WFRTZIR4aNRMTEwBdUzsAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGdcPAAWFRQAIiAaLhYWFNETExP/ExMT/xMTE/8TExP/ExMT/xMTE/8SEhL/FRUV/1NTU/+9vb3/9/f3//////////////////////////////////////////////////////////////////r6+v/BwcH/Tk5N/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xISEv8VFRX/YmJi/9bW1v/+/v7/////////////////////////////////////////////////////////////////+vr6/8jIyP9iYmH/GRkZ/xEREf8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8VFRTmHh0ZSgAAAABIQi4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT0MuAAgLDQAgHhk9FhUU3BMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8QEBD/Hx8f/11dXf+tra3/4+Pj//r6+v//////////////////////////////////////8vLy/8PDw/9tbW3/IiIi/xAQEP8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xEREf8wMDD/iIiI/9bW1f/4+fj///////////////////////////////////////39/f/p6ej/tbW1/2ZmZv8kJCT/EBAQ/xISEv8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8VFRTtHhwYXP/ZhQA3MSUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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E/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/4XFxW+IiAbMAAAAQBFPysAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADx8bEAGxoXACknHxEaGRaIFBQU8xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xQUE/gZGBacJSMcGxYWFABjWD4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAArJx8ANTAjBR0bGFwWFRTcExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xUVFOYcGxhuLCkgCiUjHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD04KgD///8AIR8aLxgXFbEUFBP7ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FBMT/RcWFb4fHhk8XVY4ATYyJQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAZl5AAB0cGAApJh4QGxoYdBYVFOQTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/FRUU6hsaF4EnJBwVFhQUAF5VOQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAODMnAFdOOAEiIBs0GBcVqxQUE/cTExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMTE/8TExP/ExMT/xMT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GIEaGReeGRkWthgYFsoYFxbZFxYV4hcWFeoYFxXvFxcV8BgXFe8WFhXnFxcV4BgXFdMZGBbDGhkXrhsaF5YdGxh4Hx0ZWSEfGzsmIx0fMy4iC2ZfRQFQSjUAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP///////+AAAA////////7///////wAAAAA///////+///////gAAAAAA///////v//////AAAAAAAB//////7//////AAAAAAAAH/////+//////AAAAAAAAAf/////v/////AAAAAAAAAB/////7/////AAAAAAAAAAH////+/////AAAAAAAAAAAf////v////gAAAAAAAAAAD////7////gAAAAAAAAAAAP///+////wAAAAAAAAAAAB////v///wAAAAAAAAAAAAH///7///4AAAAAAAAAAAAA///+///8AAAAAAAAAAAAAH///v//+AAAAAAAAAAAAAA///7///AAAAAAAAAAAAAAH//+///gAAAAAAAAAAAAAA///v//wAAAAAAAAAAAAAAH//7//4AAAAAAAAAAAAAAA//+//8AAAAAAAAAAAAAAAH//v/+AAAAAAAAAAAAAAAA//7//AAAAAAAAAAAAAAAAH/+//gAAAAAAAAAAAAAAAA//v/4AAAAAAAAAAAAAAAAP/7/8AAAAAAAAAAAAAAAAB/+/+AAAAAAAAAAAAAAAAAP/v/AAAAAAAAAAAAAAAAAB/7/wAAAAAAAAAAAAAAAAAf+/4AAAAAAAAAAAAAAAAAD/v8AAAAAAAAAAAAAAAAAAf7/AAAAAAAAAAAAAAAAAAH+/gAAAAAAAAAAAAAAAAAA/v4AAAAAAAAAAAAAAAAAAP78AAAAAAAAAAAAAAAAAAB+/AAAAAAAAAAAAAAAAAAAfvgAAAAAAAAAAAAAAAAAAD74AAAAAAAAAAAAAAAAAAA+8AAAAAAAAAAAAAAAAAAAHvAAAAAAAAAAAAAAAAAAAB7wAAAAAAAAAAAAAAAAAAAe4AAAAAAAAAAAAAAAAAAADuAAAAAAAAAAAAAAAAAAAA7AAAAAAAAAAAAAAAAAAAAGwAAAAAAAAAAAAAAAAAAABsAAAAAAAAAAAAAAAAAAAAbAAAAAAAAAAAAAAAAAAAAGgAAAAAAAAAAAAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAKAAAAAAAAAAAAAAAAAAAACgAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAKAAAAAAAAAAAAAAAAAAAACgAAAAAAAAAAAAAAAAAAAAsAAAAAAAAAAAAAAAAAAAALAAAAAAAAAAAAAAAAAAAAGwAAAAAAAAAAAAAAAAAAABuAAAAAAAAAAAAAAAAAAAAbgAAAAAAAAAAAAAAAAAAAO4AAAAAAAAAAAAAAAAAAADvAAAAAAAAAAAAAAAAAAAA7wAAAAAAAAAAAAAAAAAAAe8AAAAAAAAAAAAAAAAAAAHvgAAAAAAAAAAAAAAAAAAD74AAAAAAAAAAAAAAAAAAA+/AAAAAAAAAAAAAAAAAAAfvwAAAAAAAAAAAAAAAAAAH7+AAAAAAAAAAAAAAAAAAD+/gAAAAAAAAAAAAAAAAAA/v8AAAAAAAAAAAAAAAAAAf7/AAAAAAAAAAAAAAAAAAH+/4AAAAAAAAAAAAAAAAAD/v/AAAAAAAAAAAAAAAAAA/7/wAAAAAAAAAAAAAAAAAf+/+AAAAAAAAAAAAAAAAAP/v/wAAAAAAAAAAAAAAAAD/7/8AAAAAAAAAAAAAAAAB/+//gAAAAAAAAAAAAAAAA//v/8AAAAAAAAAAAAAAAAf/7//gAAAAAAAAAAAAAAAP/+//8AAAAAAAAAAAAAAAH//v//gAAAAAAAAAAAAAAB//7//8AAAAAAAAAAAAAAA//+///gAAAAAAAAAAAAAAf//v//8AAAAAAAAAAAAAAP//7///gAAAAAAAAAAAAAP//+///8AAAAAAAAAAAAAH///v///gAAAAAAAAAAAAD///7///8AAAAAAAAAAAAB///+////wAAAAAAAAAAAA////v///+AAAAAAAAAAAA////7////wAAAAAAAAAAAf///+/////AAAAAAAAAAAf////v////8AAAAAAAAAAf////7/////wAAAAAAAAAP////+/////+AAAAAAAAAP/////v/////8AAAAAAAAf/////7//////wAAAAAAAf/////+///////gAAAAAA///////v///////AAAAAB///////7////////AAAAH///////+"
+    $iconBytes    = [System.Convert]::FromBase64String($iconBase64)
+    $iconStream   = New-Object System.IO.MemoryStream(,$iconBytes)
+    $appIcon      = New-Object System.Drawing.Icon($iconStream)
+    $iconStream2  = New-Object System.IO.MemoryStream(,$iconBytes)
+    $headerBitmap = New-Object System.Drawing.Bitmap(
+        (New-Object System.Drawing.Icon($iconStream2)).ToBitmap(),
+        (New-Object System.Drawing.Size(22, 22))
+    )
+
+    ##Colour palette
+    $clrDark     = [System.Drawing.Color]::FromArgb(28, 28, 28)
+    $clrGreen    = [System.Drawing.Color]::FromArgb(46, 184, 69)
+    $clrBlue     = [System.Drawing.Color]::FromArgb(0, 120, 212)
+    $clrWhite    = [System.Drawing.Color]::White
+    $clrLight    = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    $clrSection  = [System.Drawing.Color]::FromArgb(245, 245, 245)
+    $clrBorder   = [System.Drawing.Color]::FromArgb(218, 218, 218)
+    $clrText     = [System.Drawing.Color]::FromArgb(28, 28, 28)
+    $clrMuted    = [System.Drawing.Color]::FromArgb(130, 130, 130)
+    $clrDisabled = [System.Drawing.Color]::FromArgb(235, 235, 235)
+    $clrGridHdr  = [System.Drawing.Color]::FromArgb(40, 40, 40)
+
+    ##Fonts
+    $fntTitle   = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
+    $fntSection = New-Object System.Drawing.Font("Segoe UI",  9, [System.Drawing.FontStyle]::Bold)
+    $fntNormal  = New-Object System.Drawing.Font("Segoe UI",  9)
+    $fntSmall   = New-Object System.Drawing.Font("Segoe UI",  8)
+
+    function Set-SecondaryButton
+    {
+        param($btn)
+        $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btn.FlatAppearance.BorderColor = $clrBorder
+        $btn.FlatAppearance.BorderSize  = 1
+        $btn.BackColor = $clrWhite
+        $btn.ForeColor = $clrText
+        $btn.Font      = $fntNormal
+        $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    }
+
+    function Set-PrimaryButton
+    {
+        param($btn, $color = $null)
+        if ($null -eq $color) { $color = $clrGreen }
+        $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btn.FlatAppearance.BorderSize  = 0
+        $btn.BackColor = $color
+        $btn.ForeColor = $clrWhite
+        $btn.Font      = $fntSection
+        $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    }
+
+    function New-StyledGrid
+    {
+        param([int]$X, [int]$Y, [int]$Width, [int]$Height,
+              [System.Windows.Forms.Control]$Parent,
+              [bool]$ReadOnly = $false)
+
+        $g                    = New-Object System.Windows.Forms.DataGridView
+        $g.Location           = New-Object System.Drawing.Point($X, $Y)
+        $g.Size               = New-Object System.Drawing.Size($Width, $Height)
+        $g.ColumnCount        = 2
+        $g.Columns[0].Name    = "Key"
+        $g.Columns[0].Width   = 180
+        $g.Columns[1].Name    = "Value"
+        $g.Columns[1].AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+        $g.AllowUserToAddRows = -not $ReadOnly
+        $g.ReadOnly           = $ReadOnly
+        $g.RowHeadersVisible  = $false
+        $g.BorderStyle        = "FixedSingle"
+        $g.BackgroundColor    = $clrWhite
+        $g.GridColor          = $clrBorder
+        $g.Font               = $fntNormal
+        $g.RowTemplate.Height = 26
+        $g.EnableHeadersVisualStyles       = $false
+        $g.ColumnHeadersHeight             = 28
+        $g.ColumnHeadersDefaultCellStyle.BackColor          = $clrGridHdr
+        $g.ColumnHeadersDefaultCellStyle.ForeColor          = $clrWhite
+        $g.ColumnHeadersDefaultCellStyle.Font               = $fntSection
+        $g.ColumnHeadersDefaultCellStyle.SelectionBackColor = $clrGridHdr
+        $g.DefaultCellStyle.SelectionBackColor = $clrBlue
+        $g.DefaultCellStyle.SelectionForeColor = $clrWhite
+        $Parent.Controls.Add($g)
+        return $g
+    }
+
+    # -------------------------------------------------------------------------
+    ##Form  (64 header + 36 tabbar + 423 content + 57 bottom = 580)
+    # -------------------------------------------------------------------------
+    $form                 = New-Object System.Windows.Forms.Form
+    $form.Text            = "CredEncrypt Utility"
+    $form.Icon            = $appIcon
+    $form.ClientSize      = New-Object System.Drawing.Size(490, 580)
+    $form.StartPosition   = "CenterScreen"
+    $form.FormBorderStyle = "FixedSingle"
+    $form.MaximizeBox     = $false
+    $form.BackColor       = $clrWhite
+    $form.Font            = $fntNormal
+
+    # -------------------------------------------------------------------------
+    ##Dark header panel
+    # -------------------------------------------------------------------------
+    $pnlHeader           = New-Object System.Windows.Forms.Panel
+    $pnlHeader.Dock      = "Top"
+    $pnlHeader.Height    = 64
+    $pnlHeader.BackColor = $clrDark
+
+    $picHeader           = New-Object System.Windows.Forms.PictureBox
+    $picHeader.Image     = $headerBitmap
+    $picHeader.Size      = New-Object System.Drawing.Size(22, 22)
+    $picHeader.Location  = New-Object System.Drawing.Point(14, 20)
+    $picHeader.SizeMode  = "Normal"
+    $picHeader.BackColor = [System.Drawing.Color]::Transparent
+
+    $lblTitle            = New-Object System.Windows.Forms.Label
+    $lblTitle.Text       = "CredEncrypt Utility"
+    $lblTitle.Font       = $fntTitle
+    $lblTitle.ForeColor  = $clrWhite
+    $lblTitle.Location   = New-Object System.Drawing.Point(44, 16)
+    $lblTitle.AutoSize   = $true
+    $lblTitle.BackColor  = [System.Drawing.Color]::Transparent
+
+    $lblVer              = New-Object System.Windows.Forms.Label
+    $lblVer.Text         = "v3.3.0"
+    $lblVer.Font         = $fntSmall
+    $lblVer.ForeColor    = [System.Drawing.Color]::FromArgb(150, 150, 150)
+    $lblVer.Location     = New-Object System.Drawing.Point(418, 24)
+    $lblVer.AutoSize     = $true
+    $lblVer.BackColor    = [System.Drawing.Color]::Transparent
+
+    $pnlHeader.Controls.AddRange(@($picHeader, $lblTitle, $lblVer))
+
+    # -------------------------------------------------------------------------
+    ##Custom tab bar - replaces TabControl to avoid internal border offset
+    # -------------------------------------------------------------------------
+    $pnlTabBar           = New-Object System.Windows.Forms.Panel
+    $pnlTabBar.Location  = New-Object System.Drawing.Point(0, 64)
+    $pnlTabBar.Size      = New-Object System.Drawing.Size(490, 36)
+    $pnlTabBar.BackColor = $clrLight
+
+    ##Draw bottom separator line on tab bar
+    $pnlTabBar.Add_Paint({
+        param($s, $e)
+        $pen = New-Object System.Drawing.Pen($clrBorder, 1)
+        $e.Graphics.DrawLine($pen, 0, $s.Height - 1, $s.Width, $s.Height - 1)
+        $pen.Dispose()
+    })
+
+    $btnEncTab           = New-Object System.Windows.Forms.Button
+    $btnEncTab.Text      = "Encrypt"
+    $btnEncTab.Size      = New-Object System.Drawing.Size(100, 35)
+    $btnEncTab.Location  = New-Object System.Drawing.Point(0, 0)
+    $btnEncTab.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnEncTab.FlatAppearance.BorderSize  = 0
+    $btnEncTab.BackColor = $clrWhite          ##selected by default
+    $btnEncTab.ForeColor = $clrText
+    $btnEncTab.Font      = $fntSection
+    $btnEncTab.Cursor    = [System.Windows.Forms.Cursors]::Hand
+
+    $btnDecTab           = New-Object System.Windows.Forms.Button
+    $btnDecTab.Text      = "Decrypt"
+    $btnDecTab.Size      = New-Object System.Drawing.Size(100, 35)
+    $btnDecTab.Location  = New-Object System.Drawing.Point(100, 0)
+    $btnDecTab.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $btnDecTab.FlatAppearance.BorderSize  = 0
+    $btnDecTab.BackColor = $clrLight          ##unselected
+    $btnDecTab.ForeColor = $clrMuted
+    $btnDecTab.Font      = $fntNormal
+    $btnDecTab.Cursor    = [System.Windows.Forms.Cursors]::Hand
+
+    $pnlTabBar.Controls.AddRange(@($btnEncTab, $btnDecTab))
+
+    # -------------------------------------------------------------------------
+    ##Content panels - same position, visibility toggled by tab buttons
+    #  y=100 (64 header + 36 tabbar), h=423 (580 - 64 - 36 - 57)
+    # -------------------------------------------------------------------------
+    $pnlEncContent          = New-Object System.Windows.Forms.Panel
+    $pnlEncContent.Location = New-Object System.Drawing.Point(0, 100)
+    $pnlEncContent.Size     = New-Object System.Drawing.Size(490, 423)
+    $pnlEncContent.BackColor = $clrWhite
+    $pnlEncContent.Visible  = $true
+
+    $pnlDecContent          = New-Object System.Windows.Forms.Panel
+    $pnlDecContent.Location = New-Object System.Drawing.Point(0, 100)
+    $pnlDecContent.Size     = New-Object System.Drawing.Size(490, 423)
+    $pnlDecContent.BackColor = $clrWhite
+    $pnlDecContent.Visible  = $false
+
+    # =========================================================================
+    ##ENCRYPT CONTENT  (controls at x=20, right margin = 490-20-width = 20)
+    # =========================================================================
+    $lblEncApp           = New-Object System.Windows.Forms.Label
+    $lblEncApp.Text      = "App Name:"
+    $lblEncApp.Location  = New-Object System.Drawing.Point(20, 24)
+    $lblEncApp.Size      = New-Object System.Drawing.Size(88, 22)
+    $lblEncApp.TextAlign = "MiddleLeft"
+
+    $txtEncApp           = New-Object System.Windows.Forms.TextBox
+    $txtEncApp.Location  = New-Object System.Drawing.Point(112, 22)
+    $txtEncApp.Size      = New-Object System.Drawing.Size(358, 22)
+    $txtEncApp.BorderStyle = "FixedSingle"
+
+    $lblEncPath          = New-Object System.Windows.Forms.Label
+    $lblEncPath.Text     = "Output Path:"
+    $lblEncPath.Location = New-Object System.Drawing.Point(20, 60)
+    $lblEncPath.Size     = New-Object System.Drawing.Size(88, 22)
+    $lblEncPath.TextAlign = "MiddleLeft"
+
+    $txtEncPath          = New-Object System.Windows.Forms.TextBox
+    $txtEncPath.Location = New-Object System.Drawing.Point(112, 58)
+    $txtEncPath.Size     = New-Object System.Drawing.Size(270, 22)
+    $txtEncPath.Text     = "C:\Temp"
+    $txtEncPath.BorderStyle = "FixedSingle"
+
+    $btnEncBrowse        = New-Object System.Windows.Forms.Button
+    $btnEncBrowse.Text   = "Browse"
+    $btnEncBrowse.Location = New-Object System.Drawing.Point(390, 56)
+    $btnEncBrowse.Size   = New-Object System.Drawing.Size(80, 26)
+    Set-SecondaryButton $btnEncBrowse
+    $btnEncBrowse.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.SelectedPath = $txtEncPath.Text
+        if ($dlg.ShowDialog() -eq "OK") { $txtEncPath.Text = $dlg.SelectedPath }
+    })
+
+    $pnlEncBand          = New-Object System.Windows.Forms.Panel
+    $pnlEncBand.Location = New-Object System.Drawing.Point(0, 96)
+    $pnlEncBand.Size     = New-Object System.Drawing.Size(490, 28)
+    $pnlEncBand.BackColor = $clrSection
+
+    $lblEncSection       = New-Object System.Windows.Forms.Label
+    $lblEncSection.Text  = [char]0x2699 + "  Credentials  ( Key / Value )"
+    $lblEncSection.Font  = $fntSection
+    $lblEncSection.ForeColor = $clrText
+    $lblEncSection.Location  = New-Object System.Drawing.Point(15, 5)
+    $lblEncSection.AutoSize  = $true
+    $pnlEncBand.Controls.Add($lblEncSection)
+
+    $gridEnc             = New-StyledGrid -X 20 -Y 132 -Width 450 -Height 212 -Parent $pnlEncContent -ReadOnly $false
+
+    $chkSD               = New-Object System.Windows.Forms.CheckBox
+    $chkSD.Text          = "  Self-destruct on success"
+    $chkSD.Location      = New-Object System.Drawing.Point(20, 356)
+    $chkSD.Size          = New-Object System.Drawing.Size(230, 22)
+    $chkSD.ForeColor     = $clrText
+
+    $lblEncNote          = New-Object System.Windows.Forms.Label
+    $lblEncNote.Text     = [char]::ConvertFromUtf32(0x1F512) + "  Plaintext is never written to disk - AES-256 encrypted, unique key per machine"
+    $lblEncNote.Location = New-Object System.Drawing.Point(20, 386)
+    $lblEncNote.Size     = New-Object System.Drawing.Size(450, 18)
+    $lblEncNote.Font     = $fntSmall
+    $lblEncNote.ForeColor = $clrMuted
+
+    $pnlEncContent.Controls.AddRange(@(
+        $lblEncApp, $txtEncApp,
+        $lblEncPath, $txtEncPath, $btnEncBrowse,
+        $pnlEncBand, $gridEnc, $chkSD, $lblEncNote
+    ))
+
+    # =========================================================================
+    ##DECRYPT CONTENT
+    # =========================================================================
+    $lblDecApp           = New-Object System.Windows.Forms.Label
+    $lblDecApp.Text      = "App Name:"
+    $lblDecApp.Location  = New-Object System.Drawing.Point(20, 24)
+    $lblDecApp.Size      = New-Object System.Drawing.Size(88, 22)
+    $lblDecApp.TextAlign = "MiddleLeft"
+    $lblDecApp.ForeColor = $clrMuted
+
+    $txtDecApp           = New-Object System.Windows.Forms.TextBox
+    $txtDecApp.Location  = New-Object System.Drawing.Point(112, 22)
+    $txtDecApp.Size      = New-Object System.Drawing.Size(358, 22)
+    $txtDecApp.BorderStyle = "FixedSingle"
+    $txtDecApp.Text      = "Auto-detected from path"
+    $txtDecApp.ForeColor = $clrMuted
+    $txtDecApp.BackColor = $clrDisabled
+    $txtDecApp.Enabled   = $false
+
+    $lblDecPath          = New-Object System.Windows.Forms.Label
+    $lblDecPath.Text     = "Cred Folder:"
+    $lblDecPath.Location = New-Object System.Drawing.Point(20, 60)
+    $lblDecPath.Size     = New-Object System.Drawing.Size(88, 22)
+    $lblDecPath.TextAlign = "MiddleLeft"
+
+    $txtDecPath          = New-Object System.Windows.Forms.TextBox
+    $txtDecPath.Location = New-Object System.Drawing.Point(112, 58)
+    $txtDecPath.Size     = New-Object System.Drawing.Size(270, 22)
+    $txtDecPath.Text     = "C:\Temp"
+    $txtDecPath.BorderStyle = "FixedSingle"
+
+    $btnDecBrowse        = New-Object System.Windows.Forms.Button
+    $btnDecBrowse.Text   = "Browse"
+    $btnDecBrowse.Location = New-Object System.Drawing.Point(390, 56)
+    $btnDecBrowse.Size   = New-Object System.Drawing.Size(80, 26)
+    Set-SecondaryButton $btnDecBrowse
+    $btnDecBrowse.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.SelectedPath = $txtDecPath.Text
+        if ($dlg.ShowDialog() -eq "OK") { $txtDecPath.Text = $dlg.SelectedPath }
+    })
+
+    $pnlDecBand          = New-Object System.Windows.Forms.Panel
+    $pnlDecBand.Location = New-Object System.Drawing.Point(0, 96)
+    $pnlDecBand.Size     = New-Object System.Drawing.Size(490, 28)
+    $pnlDecBand.BackColor = $clrSection
+
+    $lblDecSection       = New-Object System.Windows.Forms.Label
+    $lblDecSection.Text  = [char]::ConvertFromUtf32(0x1F513) + "  Decrypted Credentials"
+    $lblDecSection.Font  = $fntSection
+    $lblDecSection.ForeColor = $clrText
+    $lblDecSection.Location  = New-Object System.Drawing.Point(15, 5)
+    $lblDecSection.AutoSize  = $true
+    $pnlDecBand.Controls.Add($lblDecSection)
+
+    $gridDec             = New-StyledGrid -X 20 -Y 132 -Width 450 -Height 230 -Parent $pnlDecContent -ReadOnly $true
+
+    $chkShow             = New-Object System.Windows.Forms.CheckBox
+    $chkShow.Text        = "  Show values"
+    $chkShow.Location    = New-Object System.Drawing.Point(20, 372)
+    $chkShow.Size        = New-Object System.Drawing.Size(160, 22)
+    $chkShow.ForeColor   = $clrText
+
+    $lblDecStatus        = New-Object System.Windows.Forms.Label
+    $lblDecStatus.Text   = "Browse to the credential folder (e.g. C:\Temp\AppName), then click Read."
+    $lblDecStatus.Location = New-Object System.Drawing.Point(20, 400)
+    $lblDecStatus.Size   = New-Object System.Drawing.Size(450, 18)
+    $lblDecStatus.Font   = $fntSmall
+    $lblDecStatus.ForeColor = $clrMuted
+
+    $script:decryptedValues = @{}
+
+    $chkShow.Add_CheckedChanged({
+        if ($gridDec.Rows.Count -eq 0) { return }
+        foreach ($row in $gridDec.Rows)
+        {
+            $key = $row.Cells[0].Value
+            if (-not [string]::IsNullOrWhiteSpace($key) -and $script:decryptedValues.ContainsKey($key))
+            {
+                $row.Cells[1].Value = if ($chkShow.Checked) { $script:decryptedValues[$key] } else { "••••••••" }
+            }
+        }
+    })
+
+    $pnlDecContent.Controls.AddRange(@(
+        $lblDecApp, $txtDecApp,
+        $lblDecPath, $txtDecPath, $btnDecBrowse,
+        $pnlDecBand, $gridDec, $chkShow, $lblDecStatus
+    ))
+
+    # -------------------------------------------------------------------------
+    ##Tab switching logic
+    # -------------------------------------------------------------------------
+    $script:activeTab = "encrypt"
+
+    $btnEncTab.Add_Click({
+        $pnlEncContent.Visible   = $true
+        $pnlDecContent.Visible   = $false
+        $btnEncTab.BackColor     = $clrWhite
+        $btnEncTab.ForeColor     = $clrText
+        $btnEncTab.Font          = $fntSection
+        $btnDecTab.BackColor     = $clrLight
+        $btnDecTab.ForeColor     = $clrMuted
+        $btnDecTab.Font          = $fntNormal
+        $btnAction.Text          = [char]0x25BA + "  Run"
+        Set-PrimaryButton $btnAction $clrGreen
+        $lblStatus.Text          = "Ready"
+        $lblStatus.ForeColor     = $clrGreen
+        $script:activeTab        = "encrypt"
+    })
+
+    $btnDecTab.Add_Click({
+        $pnlEncContent.Visible   = $false
+        $pnlDecContent.Visible   = $true
+        $btnDecTab.BackColor     = $clrWhite
+        $btnDecTab.ForeColor     = $clrText
+        $btnDecTab.Font          = $fntSection
+        $btnEncTab.BackColor     = $clrLight
+        $btnEncTab.ForeColor     = $clrMuted
+        $btnEncTab.Font          = $fntNormal
+        $btnAction.Text          = [char]0x25CB + "  Read"
+        Set-PrimaryButton $btnAction $clrBlue
+        $lblStatus.Text          = "Ready"
+        $lblStatus.ForeColor     = $clrGreen
+        $script:activeTab        = "decrypt"
+    })
+
+    # -------------------------------------------------------------------------
+    ##Bottom bar
+    # -------------------------------------------------------------------------
+    $pnlBottom           = New-Object System.Windows.Forms.Panel
+    $pnlBottom.Dock      = "Bottom"
+    $pnlBottom.Height    = 57
+    $pnlBottom.BackColor = $clrLight
+
+    $pnlBottom.Add_Paint({
+        param($s, $e)
+        $pen = New-Object System.Drawing.Pen($clrBorder, 1)
+        $e.Graphics.DrawLine($pen, 0, 0, $s.Width, 0)
+        $pen.Dispose()
+    })
+
+    $lblStatus           = New-Object System.Windows.Forms.Label
+    $lblStatus.Text      = "Ready"
+    $lblStatus.Location  = New-Object System.Drawing.Point(15, 20)
+    $lblStatus.AutoSize  = $true
+    $lblStatus.Font      = $fntNormal
+    $lblStatus.ForeColor = $clrGreen
+
+    $btnClose            = New-Object System.Windows.Forms.Button
+    $btnClose.Text       = [char]0x2715 + "  Close"
+    $btnClose.Size       = New-Object System.Drawing.Size(90, 32)
+    $btnClose.Location   = New-Object System.Drawing.Point(390, 12)
+    Set-SecondaryButton $btnClose
+    $btnClose.Add_Click({ $form.Close() })
+
+    $btnAction           = New-Object System.Windows.Forms.Button
+    $btnAction.Text      = [char]0x25BA + "  Run"
+    $btnAction.Size      = New-Object System.Drawing.Size(110, 32)
+    $btnAction.Location  = New-Object System.Drawing.Point(273, 12)
+    Set-PrimaryButton $btnAction $clrGreen
+
+    $btnAction.Add_Click({
+        if ($script:activeTab -eq "encrypt")
+        {
+            if ([string]::IsNullOrWhiteSpace($txtEncApp.Text))
+            {
+                [System.Windows.Forms.MessageBox]::Show("App Name is required.", "Validation", "OK", "Warning")
+                return
+            }
+
+            $script:AppName      = $txtEncApp.Text.Trim()
+            $script:BasePath     = $txtEncPath.Text.Trim()
+            $script:SelfDestruct = $chkSD.Checked
+            $script:Credentials  = @{}
+
+            foreach ($row in $gridEnc.Rows)
+            {
+                $key = $row.Cells[0].Value
+                $val = $row.Cells[1].Value
+                if (-not [string]::IsNullOrWhiteSpace($key) -and -not [string]::IsNullOrWhiteSpace($val))
+                {
+                    $script:Credentials[$key.Trim()] = $val.Trim()
+                }
+            }
+
+            if ($script:Credentials.Count -eq 0)
+            {
+                [System.Windows.Forms.MessageBox]::Show("At least one credential key/value pair is required.", "Validation", "OK", "Warning")
+                return
+            }
+
+            $lblStatus.Text      = "Running..."
+            $lblStatus.ForeColor = $clrBlue
+            $form.Close()
+        }
+        else
+        {
+            $gridDec.Rows.Clear()
+            $script:decryptedValues = @{}
+            $lblDecStatus.ForeColor = $clrMuted
+            $lblDecStatus.Text      = "Reading..."
+            $txtDecApp.Text         = "Auto-detected from path"
+
+            try
+            {
+                $creds = Read-EncryptedCredentials -CredPath $txtDecPath.Text.Trim()
+
+                $appDetected = $creds["__AppName__"]
+                $txtDecApp.Text = $appDetected
+
+                foreach ($entry in $creds.GetEnumerator())
+                {
+                    if ($entry.Key -eq "__AppName__") { continue }
+                    $script:decryptedValues[$entry.Key] = $entry.Value
+                    $displayVal = if ($chkShow.Checked) { $entry.Value } else { "••••••••" }
+                    $gridDec.Rows.Add($entry.Key, $displayVal) | Out-Null
+                }
+
+                $count = $creds.Count - 1
+                $lblDecStatus.ForeColor = $clrGreen
+                $lblDecStatus.Text      = "$count credential(s) loaded for '$appDetected'. Toggle Show values to reveal."
+                $lblStatus.Text         = "Read OK"
+                $lblStatus.ForeColor    = $clrGreen
+            }
+            catch
+            {
+                $txtDecApp.Text         = "Auto-detected from path"
+                $lblDecStatus.ForeColor = [System.Drawing.Color]::FromArgb(200, 40, 40)
+                $lblDecStatus.Text      = "Error: $_"
+                $lblStatus.Text         = "Read failed"
+                $lblStatus.ForeColor    = [System.Drawing.Color]::FromArgb(200, 40, 40)
+            }
+        }
+    })
+
+    $pnlBottom.Controls.AddRange(@($lblStatus, $btnAction, $btnClose))
+
+    $form.Controls.AddRange(@($pnlHeader, $pnlTabBar, $pnlEncContent, $pnlDecContent, $pnlBottom))
+    $form.ShowDialog() | Out-Null
+
+    if ([string]::IsNullOrWhiteSpace($AppName) -or $null -eq $script:Credentials) { exit 0 }
+}
+
+##Validate CLI encrypt mode has credentials
+if (-not $Credentials -or $Credentials.Count -eq 0)
+{
+    Write-Host "No credentials provided. Use -Credentials @{ Key='Value' }, -Decrypt to read, or run in GUI mode." -ForegroundColor Red
+    exit 1
+}
+
+$scriptName = [System.IO.Path]::GetFileNameWithoutExtension($MyInvocation.MyCommand.Name)
+$scriptPath = $MyInvocation.MyCommand.Definition
+$hardcodedCredentials = [ordered]@{}
+$credPath   = "$BasePath\$AppName"
+$logPath    = "$BasePath\Logs\$($AppName)_$scriptName.log"
+$keyFile    = "K_$AppName.txt"
+
+foreach ($path in @($credPath, (Split-Path $logPath)))
+{
+    if (-not (Test-Path $path)) { New-Item -ItemType Directory -Path $path -Force | Out-Null }
+}
+
 function Write-SetupLog
 {
     param([string]$Message)
     "[$((Get-Date).ToString('dd/MM/yyyy HH:mm:ss'))] [$env:COMPUTERNAME] $Message" | Out-File -FilePath $logPath -Append -Encoding UTF8
 }
 
-Write-SetupLog "Credential setup started - App: $AppName (Mode: $(if ($Dev) { 'DEV - no self-delete' } else { 'Production' }))"
+Write-SetupLog "Credential setup started - App: $AppName | Path: $BasePath | SelfDestruct: $([bool]$SelfDestruct) | Launch: $(if ($guiMode) { 'GUI' } else { 'CLI' })"
 
-##Generate a unique AES-256 key for THIS machine only
 $aesKey = New-Object byte[] 32
 $rng    = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
 $rng.GetBytes($aesKey)
 $rng.Dispose()
-
 $aesKey | Out-File -FilePath "$credPath\$keyFile" -Encoding Default
 Write-SetupLog "Unique AES key generated and saved: $keyFile"
 
-##Function to encrypt a plaintext string with this machine's AES key
 function Save-EncryptedCredential
 {
-    param(
-        [string]$PlainText,
-        [string]$OutputPath,
-        [byte[]]$Key,
-        [string]$Label
-    )
-
+    param([string]$PlainText, [string]$OutputPath, [byte[]]$Key, [string]$Label)
     $secureString  = ConvertTo-SecureString -String $PlainText -AsPlainText -Force
     $encryptedText = ConvertFrom-SecureString -SecureString $secureString -Key $Key
     $encryptedText | Out-File -FilePath $OutputPath -Encoding Default
-
-    ##Clear plaintext from memory immediately
     [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString)
     )
-
     Write-SetupLog "Encrypted and saved: $Label"
 }
 
-##Merge hardcoded credentials with runtime credentials
-#Runtime parameters take precedence if the same key is supplied in both
 $allCredentials = [ordered]@{}
+foreach ($entry in $hardcodedCredentials.GetEnumerator()) { $allCredentials[$entry.Key] = $entry.Value }
+foreach ($entry in $Credentials.GetEnumerator())          { $allCredentials[$entry.Key] = $entry.Value }
 
-foreach ($entry in $hardcodedCredentials.GetEnumerator())
-{
-    $allCredentials[$entry.Key] = $entry.Value
-}
-
-foreach ($entry in $Credentials.GetEnumerator())
-{
-    $allCredentials[$entry.Key] = $entry.Value
-}
-
-##Encrypt all credentials
-#Plaintext only exists in memory, never touches disk
 $encryptedFiles = @("$keyFile")
-
 foreach ($entry in $allCredentials.GetEnumerator())
 {
     $fileName = "C_$($AppName)$($entry.Key).txt"
-    $filePath = "$credPath\$fileName"
-
-    Save-EncryptedCredential -PlainText $entry.Value -OutputPath $filePath -Key $aesKey -Label $entry.Key
-
+    Save-EncryptedCredential -PlainText $entry.Value -OutputPath "$credPath\$fileName" -Key $aesKey -Label $entry.Key
     $encryptedFiles += $fileName
 }
 
-##Verify all files were created with non-zero size
 Write-SetupLog "Verifying output files..."
-
 $allGood = $true
-
 foreach ($file in $encryptedFiles)
 {
     $fullPath = Join-Path $credPath $file
-
-    if ([System.IO.File]::Exists($fullPath) -and (Get-Item $fullPath).Length -gt 0)
-    {
-        Write-SetupLog "Verified: $file"
-    }
-
-    else
-    {
-        Write-SetupLog "MISSING OR EMPTY: $file"
-        $allGood = $false
-    }
+    if ([System.IO.File]::Exists($fullPath) -and (Get-Item $fullPath).Length -gt 0) { Write-SetupLog "Verified: $file" }
+    else { Write-SetupLog "MISSING OR EMPTY: $file"; $allGood = $false }
 }
 
-##Self-deletion block
-#Production only will be skipped entirely in dev mode
 if ($allGood)
 {
     Write-SetupLog "Setup completed successfully - $($encryptedFiles.Count - 1) credential(s) stored for $AppName"
 
-    if ($Dev)
+    if ($guiMode)
     {
-        Write-SetupLog "DEV mode - skipping self-deletion, script kept at: $scriptPath"
-        Write-Host "Setup complete (DEV mode) - script not deleted" -ForegroundColor DarkYellow
-        exit 0
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "Setup complete!`n`n$($encryptedFiles.Count - 1) credential(s) stored for $AppName`nLocation: $credPath",
+            "CredEncrypt Utility", "OK", "Information"
+        ) | Out-Null
     }
 
-    else
+    if ($SelfDestruct)
     {
-        Write-SetupLog "Production mode - scheduling self-deletion of script"
-
-        ##Use cmd.exe to delete the script after PowerShell exits
-        #Timeout gives PowerShell time to fully exit before deletion runs
+        Write-SetupLog "SelfDestruct enabled - scheduling script deletion"
         Start-Process -FilePath "cmd.exe" -ArgumentList "/C timeout /T 3 /NOBREAK >nul & del /F /Q `"$scriptPath`"" -WindowStyle Hidden
         Write-SetupLog "Self-deletion scheduled"
         exit 0
     }
+    else
+    {
+        Write-SetupLog "SelfDestruct not set - script kept at: $scriptPath"
+        Write-Host "Setup complete - script kept (use -SelfDestruct to delete on success)" -ForegroundColor Green
+        exit 0
+    }
 }
-
 else
 {
     Write-SetupLog "Setup FAILED - one or more files missing, script NOT deleted"
-    Write-Host "Setup FAILED - check log at $logPath" -ForegroundColor Red
-
-    ##Never self-delete on failure regardless of mode - keep script for diagnosis
+    if ($guiMode)
+    {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "Setup FAILED - one or more files missing.`nCheck log at:`n$logPath",
+            "CredEncrypt Utility", "OK", "Error"
+        ) | Out-Null
+    }
+    else { Write-Host "Setup FAILED - check log at $logPath" -ForegroundColor Red }
     exit 1
 }
