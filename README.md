@@ -57,8 +57,7 @@ C:\Temp\AppName\C_AppNameUsername.txt
 
 ## GUI Mode
 
-Double-clicking the script (or running it with no arguments) opens the
-PandaTools-styled GUI. No parameters are required.
+Double-clicking the script (or running it with no arguments) opens the GUI. No parameters are required.
 
 ### Encrypt tab
 
